@@ -1,0 +1,728 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+
+const STORAGE_KEY = "zlagboard-hangtime-history-v1";
+const SETTINGS_KEY = "zlagboard-hangtime-settings-v1";
+
+const formatMs = (ms) => {
+  const total = Math.max(0, Math.round(ms / 1000));
+  const min = Math.floor(total / 60);
+  const sec = total % 60;
+  return `${String(min).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+};
+
+const formatDate = (iso) => {
+  try {
+    return new Date(iso).toLocaleString("de-DE", {
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return iso;
+  }
+};
+
+const defaultSettings = {
+  workoutName: "Fingerkraft Standard",
+  holdType: "20 mm Edge",
+  targetHangSec: 10,
+  restSec: 60,
+  reps: 6,
+  thresholdDeg: 7,
+  notes: "",
+};
+
+function SummaryCard({ label, value, sub }) {
+  return (
+    <div className="rounded-3xl bg-white/5 border border-white/10 p-4 shadow-sm">
+      <div className="text-xs uppercase tracking-[0.2em] text-slate-400">{label}</div>
+      <div className="mt-2 text-2xl font-semibold text-white">{value}</div>
+      {sub ? <div className="mt-1 text-sm text-slate-400">{sub}</div> : null}
+    </div>
+  );
+}
+
+function BarChart({ history }) {
+  const sessions = history.slice(0, 10).reverse();
+  const max = Math.max(1, ...sessions.map((s) => s.totalHangMs));
+
+  return (
+    <div className="rounded-3xl border border-white/10 bg-white/5 p-4">
+      <div className="text-sm text-slate-300 mb-3">Letzte 10 Sessions – gesamte Hängezeit</div>
+      <div className="flex h-44 items-end gap-2">
+        {sessions.length === 0 ? (
+          <div className="text-sm text-slate-400">Noch keine Daten vorhanden.</div>
+        ) : (
+          sessions.map((s) => (
+            <div key={s.id} className="flex-1 min-w-0 flex flex-col items-center gap-2">
+              <div className="text-[10px] text-slate-400">{Math.round(s.totalHangMs / 1000)}s</div>
+              <div
+                className="w-full rounded-t-2xl bg-cyan-400/80"
+                style={{ height: `${Math.max(10, (s.totalHangMs / max) * 120)}px` }}
+              />
+              <div className="truncate text-[10px] text-slate-400 max-w-full">{new Date(s.date).toLocaleDateString("de-DE", { day: "2-digit", month: "2-digit" })}</div>
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default function ZlagboardHangtimeApp() {
+  const [tab, setTab] = useState("session");
+  const [settings, setSettings] = useState(defaultSettings);
+  const [history, setHistory] = useState([]);
+  const [permissionState, setPermissionState] = useState("unbekannt");
+  const [sensorEnabled, setSensorEnabled] = useState(false);
+  const [orientation, setOrientation] = useState({ beta: 0, gamma: 0 });
+  const [baseline, setBaseline] = useState({ beta: 0, gamma: 0 });
+  const [manualLoaded, setManualLoaded] = useState(false);
+  const [manualMode, setManualMode] = useState(false);
+
+  const [sessionActive, setSessionActive] = useState(false);
+  const [phase, setPhase] = useState("idle"); // idle | ready | hanging | resting | finished
+  const [repIndex, setRepIndex] = useState(1);
+  const [repStartMs, setRepStartMs] = useState(null);
+  const [currentHangMs, setCurrentHangMs] = useState(0);
+  const [restRemaining, setRestRemaining] = useState(0);
+  const [completedReps, setCompletedReps] = useState([]);
+  const [statusText, setStatusText] = useState("Bereit zum Start");
+
+  const restIntervalRef = useRef(null);
+  const animationRef = useRef(null);
+  const lastLoadedRef = useRef(false);
+
+  useEffect(() => {
+    try {
+      const savedSettings = localStorage.getItem(SETTINGS_KEY);
+      if (savedSettings) setSettings({ ...defaultSettings, ...JSON.parse(savedSettings) });
+      const savedHistory = localStorage.getItem(STORAGE_KEY);
+      if (savedHistory) setHistory(JSON.parse(savedHistory));
+    } catch (e) {
+      console.warn("Lokale Daten konnten nicht geladen werden", e);
+    }
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  }, [settings]);
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(history));
+  }, [history]);
+
+  useEffect(() => {
+    const onOrientation = (e) => {
+      setOrientation({
+        beta: Number.isFinite(e.beta) ? e.beta : 0,
+        gamma: Number.isFinite(e.gamma) ? e.gamma : 0,
+      });
+    };
+
+    if (sensorEnabled) {
+      window.addEventListener("deviceorientation", onOrientation, true);
+      return () => window.removeEventListener("deviceorientation", onOrientation, true);
+    }
+  }, [sensorEnabled]);
+
+  const motionDelta = useMemo(() => {
+    const dBeta = Math.abs((orientation.beta || 0) - (baseline.beta || 0));
+    const dGamma = Math.abs((orientation.gamma || 0) - (baseline.gamma || 0));
+    return Math.max(dBeta, dGamma);
+  }, [orientation, baseline]);
+
+  const isLoaded = manualMode ? manualLoaded : motionDelta >= Number(settings.thresholdDeg || 7);
+
+  useEffect(() => {
+    if (!sessionActive) return;
+
+    if (phase === "ready") {
+      setStatusText(isLoaded ? "Hängen erkannt – Messung läuft" : "Warte auf Belastung des Boards");
+      if (isLoaded && !lastLoadedRef.current) {
+        const start = Date.now();
+        setRepStartMs(start);
+        setPhase("hanging");
+        setStatusText(`Rep ${repIndex}: Hängen läuft`);
+      }
+    }
+
+    if (phase === "hanging") {
+      if (!isLoaded && lastLoadedRef.current && repStartMs) {
+        const duration = Date.now() - repStartMs;
+        const nextRep = {
+          rep: repIndex,
+          actualHangMs: duration,
+          targetHangMs: Number(settings.targetHangSec) * 1000,
+          deltaMs: duration - Number(settings.targetHangSec) * 1000,
+        };
+        const updated = [...completedReps, nextRep];
+        setCompletedReps(updated);
+        setCurrentHangMs(0);
+        setRepStartMs(null);
+
+        if (repIndex >= Number(settings.reps)) {
+          finishSession(updated);
+        } else {
+          setPhase("resting");
+          setRestRemaining(Number(settings.restSec));
+          setStatusText(`Pause vor Rep ${repIndex + 1}`);
+        }
+      }
+    }
+
+    lastLoadedRef.current = isLoaded;
+  }, [isLoaded, phase, sessionActive, repStartMs, repIndex, completedReps, settings]);
+
+  useEffect(() => {
+    if (phase === "hanging" && repStartMs) {
+      const tick = () => {
+        setCurrentHangMs(Date.now() - repStartMs);
+        animationRef.current = requestAnimationFrame(tick);
+      };
+      animationRef.current = requestAnimationFrame(tick);
+      return () => cancelAnimationFrame(animationRef.current);
+    }
+  }, [phase, repStartMs]);
+
+  useEffect(() => {
+    if (phase !== "resting") {
+      clearInterval(restIntervalRef.current);
+      return;
+    }
+
+    restIntervalRef.current = setInterval(() => {
+      setRestRemaining((prev) => {
+        if (prev <= 1) {
+          clearInterval(restIntervalRef.current);
+          setRepIndex((r) => r + 1);
+          setPhase("ready");
+          setStatusText("Pause beendet – nächste Wiederholung starten");
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+
+    return () => clearInterval(restIntervalRef.current);
+  }, [phase]);
+
+  const finishSession = (repsData = completedReps) => {
+    const totalHangMs = repsData.reduce((sum, r) => sum + r.actualHangMs, 0);
+    const avgHangMs = repsData.length ? totalHangMs / repsData.length : 0;
+    const entry = {
+      id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()),
+      date: new Date().toISOString(),
+      workoutName: settings.workoutName,
+      holdType: settings.holdType,
+      targetHangSec: Number(settings.targetHangSec),
+      restSec: Number(settings.restSec),
+      repsPlanned: Number(settings.reps),
+      repsDone: repsData.length,
+      totalHangMs,
+      avgHangMs,
+      notes: settings.notes,
+      reps: repsData,
+    };
+
+    setHistory((prev) => [entry, ...prev]);
+    setPhase("finished");
+    setSessionActive(false);
+    setStatusText("Workout abgeschlossen");
+  };
+
+  const startSession = () => {
+    clearInterval(restIntervalRef.current);
+    cancelAnimationFrame(animationRef.current);
+    setSessionActive(true);
+    setPhase("ready");
+    setRepIndex(1);
+    setRepStartMs(null);
+    setCurrentHangMs(0);
+    setRestRemaining(0);
+    setCompletedReps([]);
+    setStatusText("Warte auf Belastung des Boards");
+    lastLoadedRef.current = false;
+  };
+
+  const stopSession = () => {
+    clearInterval(restIntervalRef.current);
+    cancelAnimationFrame(animationRef.current);
+    setSessionActive(false);
+    setPhase("idle");
+    setRepStartMs(null);
+    setCurrentHangMs(0);
+    setRestRemaining(0);
+    setStatusText("Session gestoppt");
+  };
+
+  const calibrate = () => {
+    setBaseline({ ...orientation });
+    setStatusText("Nullpunkt kalibriert");
+  };
+
+  const requestMotionPermission = async () => {
+    try {
+      if (typeof DeviceOrientationEvent !== "undefined" && typeof DeviceOrientationEvent.requestPermission === "function") {
+        const result = await DeviceOrientationEvent.requestPermission();
+        if (result === "granted") {
+          setPermissionState("erteilt");
+          setSensorEnabled(true);
+          setManualMode(false);
+        } else {
+          setPermissionState("abgelehnt");
+        }
+      } else {
+        setPermissionState("erteilt");
+        setSensorEnabled(true);
+        setManualMode(false);
+      }
+    } catch (e) {
+      console.warn(e);
+      setPermissionState("fehler");
+    }
+  };
+
+  const totalHangToday = useMemo(() => {
+    const today = new Date().toLocaleDateString("de-DE");
+    return history
+      .filter((h) => new Date(h.date).toLocaleDateString("de-DE") === today)
+      .reduce((sum, h) => sum + h.totalHangMs, 0);
+  }, [history]);
+
+  const personalBest = useMemo(() => {
+    const values = history.flatMap((h) => h.reps?.map((r) => r.actualHangMs) || []);
+    return values.length ? Math.max(...values) : 0;
+  }, [history]);
+
+  const avgHistory = useMemo(() => {
+    if (!history.length) return 0;
+    return history.reduce((sum, h) => sum + h.avgHangMs, 0) / history.length;
+  }, [history]);
+
+  const exportHistory = () => {
+    const blob = new Blob([JSON.stringify(history, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "zlagboard-history.json";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <div
+      className="min-h-screen w-full bg-slate-950 text-slate-100"
+      style={{
+        paddingTop: "max(12px, env(safe-area-inset-top))",
+        paddingRight: "max(12px, env(safe-area-inset-right))",
+        paddingBottom: "max(12px, env(safe-area-inset-bottom))",
+        paddingLeft: "max(12px, env(safe-area-inset-left))",
+      }}
+    >
+      <div className="mx-auto flex min-h-[calc(100vh-24px)] max-w-[1180px] flex-col gap-4 rounded-[28px] border border-white/10 bg-gradient-to-br from-slate-900 to-slate-950 p-4 shadow-2xl lg:aspect-[19.5/9] lg:min-h-0">
+        <div className="flex flex-col gap-3 rounded-[28px] border border-cyan-400/20 bg-cyan-400/5 p-4 lg:flex-row lg:items-center lg:justify-between">
+          <div>
+            <div className="text-xs uppercase tracking-[0.32em] text-cyan-300">Zlagboard Hangtime Web App</div>
+            <h1 className="mt-1 text-2xl font-semibold">Landscape Dashboard für iPhone</h1>
+            <p className="mt-1 text-sm text-slate-300">
+              Motion Tracking, Workout-Setup und Trainingshistorie in einer GitHub-hostbaren Web-App.
+            </p>
+          </div>
+          <div className="grid grid-cols-2 gap-2 lg:grid-cols-4">
+            <button
+              onClick={() => setTab("session")}
+              className={`rounded-2xl px-4 py-3 text-sm font-medium ${tab === "session" ? "bg-cyan-400 text-slate-950" : "bg-white/5 text-slate-200"}`}
+            >
+              Session
+            </button>
+            <button
+              onClick={() => setTab("workout")}
+              className={`rounded-2xl px-4 py-3 text-sm font-medium ${tab === "workout" ? "bg-cyan-400 text-slate-950" : "bg-white/5 text-slate-200"}`}
+            >
+              Workout Setup
+            </button>
+            <button
+              onClick={() => setTab("history")}
+              className={`rounded-2xl px-4 py-3 text-sm font-medium ${tab === "history" ? "bg-cyan-400 text-slate-950" : "bg-white/5 text-slate-200"}`}
+            >
+              History
+            </button>
+            <button
+              onClick={() => setTab("help")}
+              className={`rounded-2xl px-4 py-3 text-sm font-medium ${tab === "help" ? "bg-cyan-400 text-slate-950" : "bg-white/5 text-slate-200"}`}
+            >
+              Hinweise
+            </button>
+          </div>
+        </div>
+
+        <div className="grid flex-1 gap-4 lg:grid-cols-[1.3fr_0.7fr] lg:overflow-hidden">
+          <div className="flex flex-col gap-4 lg:overflow-auto pr-1">
+            {tab === "session" && (
+              <>
+                <div className="grid grid-cols-2 gap-4 xl:grid-cols-4">
+                  <SummaryCard label="Status" value={statusText} sub={phase.toUpperCase()} />
+                  <SummaryCard label="Akteller Hang" value={formatMs(currentHangMs)} sub={`Ziel ${settings.targetHangSec}s`} />
+                  <SummaryCard label="Rep" value={`${Math.min(repIndex, Number(settings.reps))}/${settings.reps}`} sub={settings.holdType} />
+                  <SummaryCard label="Pause" value={restRemaining ? `${restRemaining}s` : "–"} sub={settings.workoutName} />
+                </div>
+
+                <div className="grid gap-4 lg:grid-cols-[1.1fr_0.9fr]">
+                  <div className="rounded-3xl border border-white/10 bg-white/5 p-4">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <h2 className="text-lg font-semibold">Live Tracking</h2>
+                        <p className="mt-1 text-sm text-slate-400">
+                          Automatische Erkennung über Gerätebewegung oder manueller Fallback.
+                        </p>
+                      </div>
+                      <div className="rounded-2xl bg-slate-900 px-3 py-2 text-xs text-slate-300 border border-white/10">
+                        Berechtigung: {permissionState}
+                      </div>
+                    </div>
+
+                    <div className="mt-4 grid grid-cols-2 gap-3 xl:grid-cols-4">
+                      <div className="rounded-2xl bg-slate-900/80 border border-white/10 p-3">
+                        <div className="text-xs text-slate-400">Beta</div>
+                        <div className="text-xl font-semibold">{orientation.beta.toFixed(1)}°</div>
+                      </div>
+                      <div className="rounded-2xl bg-slate-900/80 border border-white/10 p-3">
+                        <div className="text-xs text-slate-400">Gamma</div>
+                        <div className="text-xl font-semibold">{orientation.gamma.toFixed(1)}°</div>
+                      </div>
+                      <div className="rounded-2xl bg-slate-900/80 border border-white/10 p-3">
+                        <div className="text-xs text-slate-400">Delta</div>
+                        <div className="text-xl font-semibold">{motionDelta.toFixed(1)}°</div>
+                      </div>
+                      <div className="rounded-2xl bg-slate-900/80 border border-white/10 p-3">
+                        <div className="text-xs text-slate-400">Belastung</div>
+                        <div className={`text-xl font-semibold ${isLoaded ? "text-emerald-400" : "text-amber-300"}`}>
+                          {isLoaded ? "ERKANNT" : "WARTEND"}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="mt-4 h-5 overflow-hidden rounded-full bg-slate-900 border border-white/10">
+                      <div
+                        className={`h-full rounded-full transition-all ${phase === "hanging" ? "bg-cyan-400" : phase === "resting" ? "bg-amber-400" : "bg-slate-700"}`}
+                        style={{ width: `${Math.min(100, (currentHangMs / (Number(settings.targetHangSec) * 1000)) * 100)}%` }}
+                      />
+                    </div>
+                    <div className="mt-2 text-xs text-slate-400">
+                      Fortschritt aktueller Hang im Verhältnis zur Ziel-Hängezeit.
+                    </div>
+
+                    <div className="mt-5 flex flex-wrap gap-3">
+                      <button
+                        onClick={requestMotionPermission}
+                        className="rounded-2xl bg-cyan-400 px-4 py-3 text-sm font-semibold text-slate-950"
+                      >
+                        Motion aktivieren
+                      </button>
+                      <button
+                        onClick={calibrate}
+                        className="rounded-2xl bg-white/5 px-4 py-3 text-sm font-semibold text-slate-100 border border-white/10"
+                      >
+                        Nullpunkt kalibrieren
+                      </button>
+                      <button
+                        onClick={() => {
+                          setManualMode((v) => !v);
+                          setSensorEnabled(false);
+                          setPermissionState("manuell");
+                        }}
+                        className={`rounded-2xl px-4 py-3 text-sm font-semibold border ${manualMode ? "bg-amber-400 text-slate-950 border-amber-300" : "bg-white/5 text-slate-100 border-white/10"}`}
+                      >
+                        {manualMode ? "Manuell aktiv" : "Manueller Fallback"}
+                      </button>
+                      {manualMode && (
+                        <button
+                          onClick={() => setManualLoaded((v) => !v)}
+                          className={`rounded-2xl px-4 py-3 text-sm font-semibold ${manualLoaded ? "bg-emerald-400 text-slate-950" : "bg-white/5 text-slate-100 border border-white/10"}`}
+                        >
+                          {manualLoaded ? "Loslassen" : "Belastung simulieren"}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="rounded-3xl border border-white/10 bg-white/5 p-4">
+                    <h2 className="text-lg font-semibold">Workout Steuerung</h2>
+                    <p className="mt-1 text-sm text-slate-400">Session starten, stoppen und Wiederholungen live protokollieren.</p>
+
+                    <div className="mt-4 grid gap-3">
+                      <div className="rounded-2xl bg-slate-900/80 border border-white/10 p-3">
+                        <div className="text-xs text-slate-400">Workout</div>
+                        <div className="text-lg font-semibold">{settings.workoutName}</div>
+                        <div className="mt-1 text-sm text-slate-400">{settings.holdType}</div>
+                      </div>
+                      <div className="grid grid-cols-3 gap-3">
+                        <div className="rounded-2xl bg-slate-900/80 border border-white/10 p-3">
+                          <div className="text-xs text-slate-400">Ziel</div>
+                          <div className="text-lg font-semibold">{settings.targetHangSec}s</div>
+                        </div>
+                        <div className="rounded-2xl bg-slate-900/80 border border-white/10 p-3">
+                          <div className="text-xs text-slate-400">Pause</div>
+                          <div className="text-lg font-semibold">{settings.restSec}s</div>
+                        </div>
+                        <div className="rounded-2xl bg-slate-900/80 border border-white/10 p-3">
+                          <div className="text-xs text-slate-400">Reps</div>
+                          <div className="text-lg font-semibold">{settings.reps}</div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="mt-5 flex flex-wrap gap-3">
+                      <button onClick={startSession} className="rounded-2xl bg-emerald-400 px-5 py-3 text-sm font-semibold text-slate-950">
+                        Session starten
+                      </button>
+                      <button onClick={stopSession} className="rounded-2xl bg-rose-400 px-5 py-3 text-sm font-semibold text-slate-950">
+                        Session stoppen
+                      </button>
+                    </div>
+
+                    <div className="mt-5 rounded-2xl border border-white/10 bg-slate-900/70 p-3">
+                      <div className="text-sm font-medium">Abgeschlossene Wiederholungen</div>
+                      <div className="mt-3 space-y-2 max-h-52 overflow-auto pr-1">
+                        {completedReps.length === 0 ? (
+                          <div className="text-sm text-slate-400">Noch keine Wiederholung abgeschlossen.</div>
+                        ) : (
+                          completedReps.map((r) => (
+                            <div key={r.rep} className="flex items-center justify-between rounded-xl bg-white/5 px-3 py-2 text-sm">
+                              <div>Rep {r.rep}</div>
+                              <div className="font-medium">{(r.actualHangMs / 1000).toFixed(1)}s</div>
+                              <div className={r.deltaMs >= 0 ? "text-emerald-400" : "text-amber-300"}>
+                                {r.deltaMs >= 0 ? "+" : ""}{(r.deltaMs / 1000).toFixed(1)}s
+                              </div>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </>
+            )}
+
+            {tab === "workout" && (
+              <div className="rounded-3xl border border-white/10 bg-white/5 p-4">
+                <h2 className="text-lg font-semibold">Workout Setup</h2>
+                <p className="mt-1 text-sm text-slate-400">Lege Standardwerte für dein Zlagboard-Training fest.</p>
+
+                <div className="mt-5 grid gap-4 lg:grid-cols-2">
+                  <label className="block">
+                    <div className="mb-2 text-sm text-slate-300">Workout Name</div>
+                    <input
+                      value={settings.workoutName}
+                      onChange={(e) => setSettings((s) => ({ ...s, workoutName: e.target.value }))}
+                      className="w-full rounded-2xl border border-white/10 bg-slate-900 px-4 py-3 outline-none"
+                    />
+                  </label>
+
+                  <label className="block">
+                    <div className="mb-2 text-sm text-slate-300">Griff / Hold Type</div>
+                    <input
+                      value={settings.holdType}
+                      onChange={(e) => setSettings((s) => ({ ...s, holdType: e.target.value }))}
+                      className="w-full rounded-2xl border border-white/10 bg-slate-900 px-4 py-3 outline-none"
+                    />
+                  </label>
+
+                  <label className="block">
+                    <div className="mb-2 text-sm text-slate-300">Ziel-Hängezeit (Sek.)</div>
+                    <input
+                      type="number"
+                      min="1"
+                      max="180"
+                      value={settings.targetHangSec}
+                      onChange={(e) => setSettings((s) => ({ ...s, targetHangSec: Number(e.target.value) }))}
+                      className="w-full rounded-2xl border border-white/10 bg-slate-900 px-4 py-3 outline-none"
+                    />
+                  </label>
+
+                  <label className="block">
+                    <div className="mb-2 text-sm text-slate-300">Pause (Sek.)</div>
+                    <input
+                      type="number"
+                      min="1"
+                      max="600"
+                      value={settings.restSec}
+                      onChange={(e) => setSettings((s) => ({ ...s, restSec: Number(e.target.value) }))}
+                      className="w-full rounded-2xl border border-white/10 bg-slate-900 px-4 py-3 outline-none"
+                    />
+                  </label>
+
+                  <label className="block">
+                    <div className="mb-2 text-sm text-slate-300">Wiederholungen</div>
+                    <input
+                      type="number"
+                      min="1"
+                      max="30"
+                      value={settings.reps}
+                      onChange={(e) => setSettings((s) => ({ ...s, reps: Number(e.target.value) }))}
+                      className="w-full rounded-2xl border border-white/10 bg-slate-900 px-4 py-3 outline-none"
+                    />
+                  </label>
+
+                  <label className="block">
+                    <div className="mb-2 text-sm text-slate-300">Motion-Schwelle (Grad)</div>
+                    <input
+                      type="number"
+                      min="1"
+                      max="45"
+                      value={settings.thresholdDeg}
+                      onChange={(e) => setSettings((s) => ({ ...s, thresholdDeg: Number(e.target.value) }))}
+                      className="w-full rounded-2xl border border-white/10 bg-slate-900 px-4 py-3 outline-none"
+                    />
+                  </label>
+                </div>
+
+                <label className="mt-4 block">
+                  <div className="mb-2 text-sm text-slate-300">Notizen</div>
+                  <textarea
+                    value={settings.notes}
+                    onChange={(e) => setSettings((s) => ({ ...s, notes: e.target.value }))}
+                    rows={4}
+                    className="w-full rounded-2xl border border-white/10 bg-slate-900 px-4 py-3 outline-none"
+                    placeholder="z. B. Zusatzgewicht, Müdigkeit, Board-Setup"
+                  />
+                </label>
+
+                <div className="mt-4 rounded-2xl border border-emerald-400/20 bg-emerald-400/10 p-4 text-sm text-emerald-100">
+                  Alle Einstellungen werden lokal im Browser gespeichert und können direkt über GitHub Pages genutzt werden.
+                </div>
+              </div>
+            )}
+
+            {tab === "history" && (
+              <div className="space-y-4">
+                <BarChart history={history} />
+                <div className="rounded-3xl border border-white/10 bg-white/5 p-4">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <h2 className="text-lg font-semibold">Workout History</h2>
+                      <p className="mt-1 text-sm text-slate-400">Alle gespeicherten Sessions im lokalen Speicher.</p>
+                    </div>
+                    <button onClick={exportHistory} className="rounded-2xl bg-white/5 border border-white/10 px-4 py-3 text-sm font-semibold">
+                      JSON exportieren
+                    </button>
+                  </div>
+
+                  <div className="mt-4 space-y-3 max-h-[430px] overflow-auto pr-1">
+                    {history.length === 0 ? (
+                      <div className="rounded-2xl border border-dashed border-white/10 p-4 text-sm text-slate-400">
+                        Noch keine Sessions gespeichert.
+                      </div>
+                    ) : (
+                      history.map((s) => (
+                        <div key={s.id} className="rounded-2xl border border-white/10 bg-slate-900/70 p-4">
+                          <div className="flex flex-wrap items-start justify-between gap-3">
+                            <div>
+                              <div className="text-base font-semibold">{s.workoutName}</div>
+                              <div className="text-sm text-slate-400">{formatDate(s.date)} · {s.holdType}</div>
+                            </div>
+                            <div className="rounded-xl bg-white/5 px-3 py-2 text-sm text-slate-300">
+                              {Math.round(s.totalHangMs / 1000)}s gesamt
+                            </div>
+                          </div>
+                          <div className="mt-3 grid grid-cols-2 gap-3 xl:grid-cols-4">
+                            <div className="rounded-xl bg-white/5 p-3 text-sm">
+                              <div className="text-slate-400">Ø Hang</div>
+                              <div className="text-base font-semibold">{(s.avgHangMs / 1000).toFixed(1)}s</div>
+                            </div>
+                            <div className="rounded-xl bg-white/5 p-3 text-sm">
+                              <div className="text-slate-400">Geplante Reps</div>
+                              <div className="text-base font-semibold">{s.repsPlanned}</div>
+                            </div>
+                            <div className="rounded-xl bg-white/5 p-3 text-sm">
+                              <div className="text-slate-400">Erledigte Reps</div>
+                              <div className="text-base font-semibold">{s.repsDone}</div>
+                            </div>
+                            <div className="rounded-xl bg-white/5 p-3 text-sm">
+                              <div className="text-slate-400">Ziel / Pause</div>
+                              <div className="text-base font-semibold">{s.targetHangSec}s / {s.restSec}s</div>
+                            </div>
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {tab === "help" && (
+              <div className="rounded-3xl border border-white/10 bg-white/5 p-4">
+                <h2 className="text-lg font-semibold">Hinweise zur Nutzung</h2>
+                <div className="mt-4 space-y-4 text-sm text-slate-300">
+                  <div className="rounded-2xl border border-white/10 bg-slate-900/70 p-4">
+                    <div className="font-medium text-white">1. Motion Tracking</div>
+                    <p className="mt-1">
+                      Auf iPhone/Safari muss der Nutzer die Sensorfreigabe meist aktiv bestätigen. Danach den Nullpunkt kalibrieren, das Gerät im Board fixieren und die Schwelle anpassen.
+                    </p>
+                  </div>
+                  <div className="rounded-2xl border border-white/10 bg-slate-900/70 p-4">
+                    <div className="font-medium text-white">2. Manuelle Rückfallebene</div>
+                    <p className="mt-1">
+                      Wenn keine verlässliche Gerätebewegung erkannt wird, kann die Belastung über die manuelle Taste simuliert werden. So bleibt die App auch ohne Sensoren nutzbar.
+                    </p>
+                  </div>
+                  <div className="rounded-2xl border border-white/10 bg-slate-900/70 p-4">
+                    <div className="font-medium text-white">3. GitHub Hosting</div>
+                    <p className="mt-1">
+                      Die App ist als reines Frontend angelegt. Für GitHub Pages reichen ein Vite- oder React-Build und statische Assets. Historie und Einstellungen werden lokal im Browser gespeichert.
+                    </p>
+                  </div>
+                  <div className="rounded-2xl border border-white/10 bg-slate-900/70 p-4">
+                    <div className="font-medium text-white">4. Nächster Ausbauschritt</div>
+                    <p className="mt-1">
+                      Sinnvoll wären als Nächstes: Benutzerprofile, CSV-Export, Trainingspläne, iPhone Install-Hinweise und ein PWA-Manifest mit Homescreen-Icon.
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div className="flex flex-col gap-4 lg:overflow-auto pr-1">
+            <div className="rounded-3xl border border-white/10 bg-white/5 p-4">
+              <h2 className="text-lg font-semibold">Performance Snapshot</h2>
+              <div className="mt-4 grid gap-3">
+                <SummaryCard label="Heute" value={`${Math.round(totalHangToday / 1000)}s`} sub="gesamte Hängezeit" />
+                <SummaryCard label="Persönliche Bestzeit" value={`${(personalBest / 1000).toFixed(1)}s`} sub="längster einzelner Hang" />
+                <SummaryCard label="Historischer Schnitt" value={`${(avgHistory / 1000).toFixed(1)}s`} sub="durchschnittlicher Hang pro Session" />
+              </div>
+            </div>
+
+            <div className="rounded-3xl border border-white/10 bg-white/5 p-4">
+              <h2 className="text-lg font-semibold">Motion Setup</h2>
+              <div className="mt-3 space-y-3 text-sm text-slate-300">
+                <div className="rounded-2xl bg-slate-900/80 border border-white/10 p-3">
+                  <div className="text-slate-400">Baseline</div>
+                  <div className="mt-1 font-medium">β {baseline.beta.toFixed(1)}° · γ {baseline.gamma.toFixed(1)}°</div>
+                </div>
+                <div className="rounded-2xl bg-slate-900/80 border border-white/10 p-3">
+                  <div className="text-slate-400">Schwelle</div>
+                  <div className="mt-1 font-medium">{settings.thresholdDeg}°</div>
+                </div>
+                <div className="rounded-2xl bg-slate-900/80 border border-white/10 p-3 text-slate-400">
+                  Tipp: Mit kleinerer Schwelle wird die Erkennung empfindlicher; mit größerer Schwelle robuster gegen Zittern.
+                </div>
+              </div>
+            </div>
+
+            <div className="rounded-3xl border border-white/10 bg-white/5 p-4">
+              <h2 className="text-lg font-semibold">Design für Querformat</h2>
+              <p className="mt-2 text-sm text-slate-400">
+                Optimiert für breite iPhone-Ansicht mit großen Touch-Zielen, Safe-Area-Padding und klarer Trennung zwischen Live-Session und Analyse.
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
